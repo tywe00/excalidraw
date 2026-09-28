@@ -2,6 +2,9 @@
   "name": "with-nextjs",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
     "build:packages": "yarn --cwd ../../ build:packages",
     "build:workspace": "yarn build:packages && yarn copy:assets",
