@@ -57,6 +57,7 @@ import {
   ARROW_TYPE,
   DEFAULT_REDUCED_GLOBAL_ALPHA,
   DEFAULT_STICKY_NOTE_SIZE,
+  ZEN_MODE_TRANSITION_DURATION,
   isLocalLink,
   normalizeLink,
   toValidURL,
@@ -88,7 +89,6 @@ import {
   applyDarkModeFilter,
   AppEventBus,
   type EXPORT_IMAGE_TYPES,
-  randomInteger,
   CLASSES,
   Emitter,
   MINIMUM_ARROW_SIZE,
@@ -109,6 +109,7 @@ import {
   isSelectionLikeTool,
   oneOf,
   getStrokeWidthByKey,
+  TEXT_VIEWPORT_PADDING,
 } from "@excalidraw/common";
 
 import {
@@ -193,7 +194,6 @@ import {
   isElementInFrame,
   getFrameLikeTitle,
   getElementsOverlappingFrame,
-  filterElementsEligibleAsFrameChildren,
   hitElementBoundText,
   hitElementBoundingBoxOnly,
   hitElementItself,
@@ -219,7 +219,6 @@ import {
   isSelectedViaGroup,
   selectGroupsForSelectedElements,
   syncInvalidIndices,
-  syncMovedIndices,
   excludeElementsInFramesFromSelection,
   getSelectionStateForElements,
   makeNextSelectedElementIds,
@@ -248,7 +247,6 @@ import {
   getElementBounds,
   doBoundsIntersect,
   isPointInElement,
-  maxBindingDistance_simple,
   convertToExcalidrawElements,
   type ExcalidrawElementSkeleton,
   getSnapOutlineMidPoint,
@@ -351,11 +349,7 @@ import { ActionManager } from "../actions/manager";
 import { actions } from "../actions/register";
 import { getShortcutFromShortcutName } from "../actions/shortcuts";
 import { trackEvent } from "../analytics";
-import {
-  getDefaultAppState,
-  isEraserActive,
-  isHandToolActive,
-} from "../appState";
+import { getDefaultAppState, isEraserActive } from "../appState";
 import {
   copyTextToSystemClipboard,
   parseClipboard,
@@ -423,6 +417,7 @@ import { Renderer } from "../scene/Renderer";
 import {
   type SetViewportOptions,
   getViewportForZoomWithScrollConstraints,
+  scrollBoundsIntoView,
 } from "../viewport";
 import { ElementCanvasButtons } from "../components/ElementCanvasButtons";
 import { LaserTrails } from "../laserTrails";
@@ -449,10 +444,12 @@ import ConvertElementTypePopup, {
 
 import { activeConfirmDialogAtom } from "./ActiveConfirmDialog";
 import { AppArrowText } from "./App.arrowText";
+import { AppTextTool } from "./App.textTool";
 import { AppBucketFill } from "./App.bucketFill";
 import { AppToolDrag, TOOL_DRAG_PREVIEW_OPACITY } from "./App.toolDrag";
 import { AppCursor } from "./App.cursor";
 import { AppDrawShape } from "./App.drawshape";
+import { AppDuplicate } from "./App.duplicate";
 import { AppFlowchart } from "./App.flowchart";
 import { AppPan } from "./App.pan";
 import { AppViewport, RIGHT_SIDEBAR_WIDTH } from "./App.viewport";
@@ -460,6 +457,7 @@ import { AppWheel } from "./App.wheel";
 import BraveMeasureTextError from "./BraveMeasureTextError";
 import { ContextMenu, CONTEXT_MENU_SEPARATOR } from "./ContextMenu";
 import { activeEyeDropperAtom } from "./EyeDropper";
+import { FileDropOverlay } from "./FileDropOverlay";
 import { ViewportStatusBorder } from "./ViewportStatusFrame/ViewportStatusFrame";
 import LayerUI from "./LayerUI";
 import { ElementCanvasButton } from "./MagicButton";
@@ -467,6 +465,7 @@ import { SVGLayer } from "./SVGLayer";
 import Spinner from "./Spinner";
 import { searchItemInFocusAtom } from "./SearchMenu";
 import { isSidebarDockedAtom } from "./Sidebar/Sidebar";
+import { hideTooltip } from "./Tooltip";
 import { StaticCanvas, InteractiveCanvas } from "./canvases";
 import NewElementCanvas from "./canvases/NewElementCanvas";
 import { isPointHittingLink } from "./hyperlink/helpers";
@@ -650,6 +649,7 @@ class App extends React.Component<AppProps, AppState> {
   );
 
   private excalidrawContainerRef = React.createRef<HTMLDivElement>();
+  private zenModeTransitionTimer = 0;
 
   public get ownerDocument(): Document {
     return (
@@ -717,13 +717,16 @@ class App extends React.Component<AppProps, AppState> {
   public onStateChange: OnStateChange = this.appStateObserver.onStateChange;
 
   public bucketFill: AppBucketFill = new AppBucketFill(this);
+  public duplicate: AppDuplicate = new AppDuplicate(this);
   public toolDrag: AppToolDrag = new AppToolDrag(this);
   public flowchart: AppFlowchart = new AppFlowchart(this);
   public cursor: AppCursor = new AppCursor(this);
   public arrowText: AppArrowText = new AppArrowText(this);
   public pan: AppPan = new AppPan(this, {
     getPointerCount: () => gesture.pointers.size,
+    isDraggingScrollBar: () => isDraggingScrollBar,
   });
+  public textTool: AppTextTool = new AppTextTool(this);
   public viewport: AppViewport = new AppViewport(this, {
     getContainer: () => this.excalidrawContainerRef.current,
     getStylesPanelMode: () => this.stylesPanelMode,
@@ -1205,6 +1208,7 @@ class App extends React.Component<AppProps, AppState> {
         ),
         this.scene.getNonDeletedElements(),
         elementsMap,
+        this.state.zoom,
       );
       const element = LinearElementEditor.getElement(
         this.state.selectedLinearElement.elementId,
@@ -1338,6 +1342,7 @@ class App extends React.Component<AppProps, AppState> {
         pointFrom<GlobalPoint>(x, y),
         this.scene.getNonDeletedElements(),
         this.scene.getNonDeletedElementsMap(),
+        this.state.zoom,
       );
 
       if (hoveredElement && this.state.bindMode !== "skip") {
@@ -2447,9 +2452,10 @@ class App extends React.Component<AppProps, AppState> {
             ? POINTER_EVENTS.disabled
             : POINTER_EVENTS.enabled,
           ["--right-sidebar-width" as any]: `${RIGHT_SIDEBAR_WIDTH}px`,
+          ["--zen-mode-transition-duration" as any]: `${ZEN_MODE_TRANSITION_DURATION}ms`,
         }}
         ref={this.excalidrawContainerRef}
-        onDrop={this.isInteractionEnabled() ? this.handleAppOnDrop : undefined}
+        onDrop={this.isFileDropEnabled() ? this.handleAppOnDrop : undefined}
         tabIndex={0}
         onKeyDown={
           this.props.handleKeyboardGlobally || !this.isInteractionEnabled()
@@ -2538,6 +2544,9 @@ class App extends React.Component<AppProps, AppState> {
                             ]}
                           />
                           {this.isDefaultUIEnabled() && <CursorHint />}
+                          {this.isDefaultUIEnabled() &&
+                            this.isInteractionEnabled() &&
+                            !this.state.viewModeEnabled && <FileDropOverlay />}
                           {this.isDefaultUIEnabled() &&
                             selectedElements.length === 1 &&
                             this.state.openDialog?.name !==
@@ -2741,7 +2750,7 @@ class App extends React.Component<AppProps, AppState> {
                             onClick={this.handleCanvasClick}
                             onPointerMove={this.handleCanvasPointerMove}
                             onPointerUp={this.handleCanvasPointerUp}
-                            onPointerCancel={this.removePointer}
+                            onPointerCancel={this.handleCanvasPointerCancel}
                             onTouchMove={this.handleTouchMove}
                             onPointerDown={this.handleCanvasPointerDown}
                             onDoubleClick={this.handleCanvasDoubleClick}
@@ -3255,6 +3264,18 @@ class App extends React.Component<AppProps, AppState> {
     event.preventDefault();
   };
 
+  private isFileDropEnabled() {
+    return this.isInteractionEnabled() && !this.state.viewModeEnabled;
+  }
+
+  private onDragOver = (event: DragEvent) => {
+    event.preventDefault();
+    if (!this.isFileDropEnabled() && event.dataTransfer) {
+      // show a no-drop cursor
+      event.dataTransfer.dropEffect = "none";
+    }
+  };
+
   // handles only the navigation keyboard: page-scroll keys and
   // `navigation`-flagged action shortcuts (canvas zoom & zoom-to-fit — see
   // `ActionManager.handleKeyDown` gates); the rest of the keyboard handling
@@ -3364,7 +3385,9 @@ class App extends React.Component<AppProps, AppState> {
 
     this.setState({
       contextMenu: null,
-      openMenu: null,
+      // keep the main menu open when entering view mode, since that's where
+      // the user usually toggles it from (Preferences submenu)
+      openMenu: this.isInteractionEnabled() ? this.state.openMenu : null,
       openPopup: null,
       cursorButton: "up",
       bindMode: "orbit",
@@ -3380,6 +3403,7 @@ class App extends React.Component<AppProps, AppState> {
       suggestedBinding: null,
       frameToHighlight: null,
       elementsToHighlight: null,
+      textToolHover: null,
       snapLines: [],
       showHyperlinkPopup: false,
     });
@@ -3923,6 +3947,8 @@ class App extends React.Component<AppProps, AppState> {
       }
     }
 
+    this.ownerWindow.clearTimeout(this.zenModeTransitionTimer);
+    this.unmarkZenModeTransition();
     this.editorLifecycleEvents.emit("editor:unmount");
     this.props.onUnmount?.();
     this.props.onExcalidrawAPI?.(null);
@@ -4000,6 +4026,20 @@ class App extends React.Component<AppProps, AppState> {
         this.ownerWindow,
         EVENT.MESSAGE,
         this.onWindowMessage,
+        false,
+      ),
+      // cancelled even when drops are ignored (view mode, non-interactive),
+      // so a dropped file doesn't make the browser navigate away to it
+      addEventListener(
+        this.excalidrawContainerRef.current,
+        EVENT.DRAG_OVER,
+        this.onDragOver,
+        false,
+      ),
+      addEventListener(
+        this.excalidrawContainerRef.current,
+        EVENT.DROP,
+        this.disableEvent,
         false,
       ),
       addEventListener(
@@ -4223,18 +4263,6 @@ class App extends React.Component<AppProps, AppState> {
         this.wheel.handle,
         { passive: false },
       ),
-      addEventListener(
-        this.excalidrawContainerRef.current,
-        EVENT.DRAG_OVER,
-        this.disableEvent,
-        false,
-      ),
-      addEventListener(
-        this.excalidrawContainerRef.current,
-        EVENT.DROP,
-        this.disableEvent,
-        false,
-      ),
     );
 
     if (this.props.detectScroll) {
@@ -4247,6 +4275,43 @@ class App extends React.Component<AppProps, AppState> {
         ),
       );
     }
+  }
+
+  getSnapshotBeforeUpdate(prevProps: AppProps, prevState: AppState) {
+    // before the DOM update, so the transition styles are in place by the time
+    // the zen-mode class changes (layout reads during commit would otherwise
+    // resolve the new styles without them)
+    if (prevState.zenModeEnabled !== this.state.zenModeEnabled) {
+      this.markZenModeTransition();
+    }
+    return null;
+  }
+
+  /**
+   * Flags the container while toggling zen mode so that UI chrome
+   * (backgrounds etc.) animates only then, and hover transitions stay
+   * instant. A data attribute so that React doesn't reset it on re-render.
+   */
+  private markZenModeTransition() {
+    const container = this.excalidrawContainerRef.current;
+    if (!container) {
+      return;
+    }
+    // controls fade out or slide over without the pointer moving, so nothing
+    // would retract a tooltip anchored to one of them
+    hideTooltip();
+    container.setAttribute("data-zen-mode-transition", "");
+    this.ownerWindow.clearTimeout(this.zenModeTransitionTimer);
+    this.zenModeTransitionTimer = this.ownerWindow.setTimeout(() => {
+      this.unmarkZenModeTransition();
+      // slightly past the CSS transition so it isn't cut short
+    }, ZEN_MODE_TRANSITION_DURATION + 100);
+  }
+
+  private unmarkZenModeTransition() {
+    this.excalidrawContainerRef.current?.removeAttribute(
+      "data-zen-mode-transition",
+    );
   }
 
   componentDidUpdate(prevProps: AppProps, prevState: AppState) {
@@ -4289,6 +4354,17 @@ class App extends React.Component<AppProps, AppState> {
       this.setState({ showWelcomeScreen: true });
     }
 
+    // neither the text tool's hover affordance nor a pending center click
+    // may outlive the tool, however it gets left (Esc/finalize paths bypass
+    // setActiveTool) — the tool coming back mid-press must not revive them
+    if (
+      prevState.activeTool.type === "text" &&
+      this.state.activeTool.type !== "text"
+    ) {
+      this.textTool.clearHover();
+      this.textTool.cancel();
+    }
+
     if (
       prevState.zoom.value !== this.state.zoom.value ||
       prevState.scrollX !== this.state.scrollX ||
@@ -4304,6 +4380,9 @@ class App extends React.Component<AppProps, AppState> {
         this.state.scrollY,
         this.state.zoom,
       );
+      // the scene moved under a still pointer: what a text-tool click would
+      // do there may have changed
+      this.textTool.refresh();
     }
 
     if (
@@ -4825,11 +4904,6 @@ class App extends React.Component<AppProps, AppState> {
     const elements = restoreElements(opts.elements, null, {
       deleteInvisibleElements: true,
     });
-    const [minX, minY, maxX, maxY] = getCommonBounds(elements);
-
-    const elementsCenterX = distance(minX, maxX) / 2;
-    const elementsCenterY = distance(minY, maxY) / 2;
-
     const clientX =
       typeof opts.position === "object"
         ? opts.position.clientX
@@ -4843,56 +4917,20 @@ class App extends React.Component<AppProps, AppState> {
         ? this.viewport.lastPosition.y
         : this.state.height / 2 + this.state.offsetTop;
 
-    const { x, y } = viewportCoordsToSceneCoords(
-      { clientX, clientY },
-      this.state,
+    const duplication = this.duplicate.duplicateAtSceneCoords(
+      elements,
+      viewportCoordsToSceneCoords({ clientX, clientY }, this.state),
+      {
+        retainSeed: opts.retainSeed,
+        preserveFrameChildrenOrder: opts.preserveFrameChildrenOrder,
+      },
     );
 
-    const dx = x - elementsCenterX;
-    const dy = y - elementsCenterY;
-
-    const [gridX, gridY] = getGridPoint(dx, dy, this.getEffectiveGridSize());
-
-    const { duplicatedElements } = duplicateElements({
-      type: "everything",
-      elements: elements.map((element) => {
-        return newElementWith(element, {
-          x: element.x + gridX - minX,
-          y: element.y + gridY - minY,
-        });
-      }),
-      randomizeSeed: !opts.retainSeed,
-      preserveFrameChildrenOrder: opts.preserveFrameChildrenOrder,
-    });
-
-    const prevElements = this.scene.getElementsIncludingDeleted();
-    let nextElements: ExcalidrawElement[] = [
-      ...prevElements,
-      ...duplicatedElements,
-    ];
-
-    const mappedNewSceneElements = this.props.onDuplicate?.(
-      nextElements,
-      prevElements,
-    );
-
-    nextElements = mappedNewSceneElements || nextElements;
-
-    syncMovedIndices(nextElements, arrayToMap(duplicatedElements));
-
-    const topLayerFrame = this.getTopLayerFrameAtSceneCoords({ x, y });
-
-    if (topLayerFrame) {
-      const eligibleElements = filterElementsEligibleAsFrameChildren(
-        duplicatedElements,
-        topLayerFrame,
-      );
-      nextElements = addElementsToFrame(
-        nextElements,
-        eligibleElements,
-        topLayerFrame,
-      );
+    if (!duplication) {
+      return;
     }
+
+    const { nextElements, duplicatedElements } = duplication;
 
     this.scene.replaceAllElements(nextElements);
 
@@ -5050,8 +5088,12 @@ class App extends React.Component<AppProps, AppState> {
     });
     const lineHeight = getLineHeight(textElementProps.fontFamily);
     const [x1, , x2] = getVisibleSceneBounds(this.state);
-    // long texts should not go beyond 800 pixels in width nor should it go below 200 px
-    const maxTextWidth = Math.max(Math.min((x2 - x1) * 0.5, 800), 200);
+    // long texts should not go beyond 800 pixels in width nor should it go
+    // below 200 px — nor, whatever those make of it, outgrow the view
+    const maxTextWidth = Math.min(
+      Math.max(Math.min((x2 - x1) * 0.5, 800), 200),
+      this.getMaxTextWidth(),
+    );
     const LINE_GAP = 10;
     let currentY = y;
 
@@ -5119,6 +5161,17 @@ class App extends React.Component<AppProps, AppState> {
         this.state,
       ),
     });
+    // wrapped to fit the view: make sure all of it is in view, too
+    if (textElements.some((element) => !element.autoResize)) {
+      const scroll = scrollBoundsIntoView({
+        bounds: getCommonBounds(textElements),
+        appState: this.state,
+        offsets: this.getTextViewportOffsets(),
+      });
+      if (scroll) {
+        this.viewport.translate(scroll);
+      }
+    }
 
     if (
       !isPlainPaste &&
@@ -5150,8 +5203,14 @@ class App extends React.Component<AppProps, AppState> {
 
     if (event.type === "pointercancel") {
       // the browser took the pointer over (scroll, palm rejection) — no
-      // pointerup will follow, so the armed bucket fill must not commit
+      // pointerup will follow, so the armed bucket fill must not commit and
+      // the text tool's pending center click must not resolve either. Both
+      // are canceled right here, ahead of the gesture teardown that follows
+      // (handleCanvasPointerCancel): that teardown first flushes a pointermove
+      // the gesture has queued, and with the click still pending that move
+      // would resolve it as a drag.
       this.bucketFill.cancel();
+      this.textTool.cancel();
     }
 
     const wasMultiTouchGesture = gesture.pointers.size >= 2;
@@ -5273,7 +5332,8 @@ class App extends React.Component<AppProps, AppState> {
   };
 
   /** emits an UNFOLLOW intent if currently following someone — use on
-   *  user-initiated viewport changes which should break follow mode */
+   *  viewport changes that take the view over from the followed user (user
+   *  pans and zooms, `setViewport` navigation) */
   public requestUnfollow = () => {
     if (this.props.userToFollow) {
       this.emitUserFollowIntent({
@@ -5286,6 +5346,16 @@ class App extends React.Component<AppProps, AppState> {
   setToast = (toast: AppState["toast"]) => {
     this.setState({ toast });
   };
+
+  private showSceneReplacedToast() {
+    this.setToast({
+      message: t("fileDrop.replacedToast", {
+        shortcut: getShortcutKey("CtrlOrCmd+Z"),
+      }),
+      closable: true,
+      duration: 8000,
+    });
+  }
 
   restoreFileFromShare = async () => {
     try {
@@ -5804,7 +5874,7 @@ class App extends React.Component<AppProps, AppState> {
 
         // the toggle changes what a text-tool click at the current position
         // would do, with no pointermove to refresh the affordance
-        this.arrowText.refresh();
+        this.textTool.refresh(event);
 
         maybeHandleArrowPointlikeDrag({ app: this, event });
       }
@@ -6063,12 +6133,6 @@ class App extends React.Component<AppProps, AppState> {
           this.state,
         );
 
-        const hoveredElement = getHoveredElementForBinding(
-          pointFrom<GlobalPoint>(scenePointer.x, scenePointer.y),
-          this.scene.getNonDeletedElements(),
-          this.scene.getNonDeletedElementsMap(),
-        );
-
         if (this.state.selectedLinearElement) {
           const element = LinearElementEditor.getElement(
             this.state.selectedLinearElement.elementId,
@@ -6076,6 +6140,13 @@ class App extends React.Component<AppProps, AppState> {
           );
 
           if (isBindingElement(element)) {
+            const hoveredElement = getHoveredElementForBinding(
+              pointFrom<GlobalPoint>(scenePointer.x, scenePointer.y),
+              this.scene.getNonDeletedElements(),
+              this.scene.getNonDeletedElementsMap(),
+              this.state.zoom,
+            );
+
             this.handleDelayedBindModeChange(element, hoveredElement);
           }
         }
@@ -6088,7 +6159,7 @@ class App extends React.Component<AppProps, AppState> {
           this.setState({ isBindingEnabled: preferenceEnabled });
         });
 
-        this.arrowText.refresh();
+        this.textTool.refresh(event);
       }
 
       maybeHandleArrowPointlikeDrag({ app: this, event });
@@ -6236,9 +6307,6 @@ class App extends React.Component<AppProps, AppState> {
           ? prevState.selectedLinearElement
           : null,
         frameToHighlight: null,
-        // only the text tool offers arrow-endpoint binding, and the highlight
-        // is refreshed on pointermove — don't leave a stale one behind
-        hoveredArrowTextAnchor: null,
       } as const;
 
       if (nextActiveTool.type === "freedraw") {
@@ -6381,6 +6449,33 @@ class App extends React.Component<AppProps, AppState> {
     gesture.initialScale = null;
   });
 
+  /**
+   * The part of the canvas a typed or pasted text is kept within, as offsets
+   * from its edges (screen px): all of it but the sidebar, less some room
+   * at each side.
+   */
+  private getTextViewportOffsets = () => {
+    const { left, right } = this.viewport.getSidebarInsets();
+    const padding = TEXT_VIEWPORT_PADDING;
+    return {
+      top: padding,
+      right: right + padding,
+      bottom: padding,
+      left: left + padding,
+    };
+  };
+
+  /**
+   * The widest a text may grow to as it's typed or pasted, in scene units:
+   * the width of the part of the canvas it's kept within, so that a text
+   * never outgrows the view.
+   */
+  private getMaxTextWidth = () => {
+    const { left, right } = this.getTextViewportOffsets();
+    const width = this.state.width - left - right;
+    return width > 0 ? width / this.state.zoom.value : Infinity;
+  };
+
   private handleTextWysiwyg(
     element: NonDeleted<ExcalidrawTextElement>,
     {
@@ -6415,6 +6510,8 @@ class App extends React.Component<AppProps, AppState> {
             originalText: nextOriginalText,
           })
         : null;
+      // a free text stops growing at the view's width and wraps from there
+      const maxWidth = this.getMaxTextWidth();
 
       this.scene.replaceAllElements([
         // Not sure why we include deleted elements as well hence using deleted elements map
@@ -6437,12 +6534,39 @@ class App extends React.Component<AppProps, AppState> {
                   getContainerElement(_element, elementsMap),
                   elementsMap,
                   nextOriginalText,
+                  maxWidth,
                 )),
             });
           }
           return _element;
         }),
       ]);
+
+      const updatedTextElement = this.scene.getNonDeletedElement(
+        latestTextElement.id,
+      );
+      if (
+        latestTextElement.autoResize &&
+        updatedTextElement &&
+        isTextElement(updatedTextElement) &&
+        !updatedTextElement.autoResize
+      ) {
+        // it just started wrapping at the view's width: bring all of it into
+        // view (right edge off the view's by the same room as the width
+        // left) — vertically only if it fits; the caret follows the rest
+        const scroll = scrollBoundsIntoView({
+          bounds: getElementBounds(
+            updatedTextElement,
+            this.scene.getNonDeletedElementsMap(),
+          ),
+          appState: this.state,
+          offsets: this.getTextViewportOffsets(),
+          tooLarge: "leave",
+        });
+        if (scroll) {
+          this.viewport.translate(scroll);
+        }
+      }
 
       if (stickyContainer) {
         // the note may have grown or shrunk — arrows bound to it must follow
@@ -6868,14 +6992,13 @@ class App extends React.Component<AppProps, AppState> {
     });
   }
 
+  /**
+   * The text container at a position — an arrow hit on its path, any other
+   * container hit anywhere in its bounds (frames are skipped so a container
+   * inside one can be hit). Purely positional: the selection plays no part.
+   */
   getTextBindableContainerAtPosition(x: number, y: number) {
     const elements = this.scene.getNonDeletedElements();
-    const selectedElements = this.scene.getSelectedElements(this.state);
-    if (selectedElements.length === 1) {
-      return isTextBindableContainer(selectedElements[0], false)
-        ? selectedElements[0]
-        : null;
-    }
     let hitElement = null;
     // We need to do hit testing from front (end of the array) to back (beginning of the array)
     for (let index = elements.length - 1; index >= 0; --index) {
@@ -6937,6 +7060,7 @@ class App extends React.Component<AppProps, AppState> {
     autoEdit = true,
     initialCaretSceneCoords,
     arrowEndpoint,
+    textElement,
   }: {
     /** X position to insert text at */
     sceneX: number;
@@ -6952,6 +7076,13 @@ class App extends React.Component<AppProps, AppState> {
      * dictates the text's position and alignment, overriding (sceneX, sceneY)
      */
     arrowEndpoint?: ArrowEndpoint | null;
+    /**
+     * the text to edit: an element to edit exactly that one; `null` to always
+     * create, never adopting a selected text or one under the pointer;
+     * `undefined` to resolve it here — a single selected text, the label of a
+     * selected or passed arrow container, else the text at (sceneX, sceneY)
+     */
+    textElement?: NonDeleted<ExcalidrawTextElement> | null;
   }) => {
     let shouldBindToContainer = false;
 
@@ -6995,6 +7126,8 @@ class App extends React.Component<AppProps, AppState> {
     }
     const existingTextElement = arrowEndpointBinding
       ? null
+      : textElement !== undefined
+      ? textElement
       : this.getSelectedTextElement(container) ||
         (container && isArrowElement(container)
           ? getBoundTextElement(
@@ -7120,13 +7253,12 @@ class App extends React.Component<AppProps, AppState> {
           shouldBindToContainer && container && isArrowElement(container)
             ? DEFAULT_BOUND_TEXT_LABEL_POSITION
             : null,
-        groupIds: container?.groupIds ?? [],
+        groupIds: shouldBindToContainer ? container?.groupIds ?? [] : [],
         lineHeight,
-        angle: container
-          ? isArrowElement(container)
-            ? (0 as Radians)
-            : container.angle
-          : (0 as Radians),
+        angle:
+          shouldBindToContainer && container && !isArrowElement(container)
+            ? container.angle
+            : (0 as Radians),
         frameId,
       });
 
@@ -7160,7 +7292,8 @@ class App extends React.Component<AppProps, AppState> {
       );
     }
 
-    if (autoEdit || existingTextElement || container) {
+    // A nearby container only skips drag sizing when the text binds to it.
+    if (autoEdit || existingTextElement || shouldBindToContainer) {
       this.handleTextWysiwyg(element, {
         isExistingElement: !!existingTextElement,
         initialCaretSceneCoords: existingTextElement
@@ -7396,7 +7529,13 @@ class App extends React.Component<AppProps, AppState> {
         const container =
           // skip binding to container on dblclick when holding ctrl
           !event[KEYS.CTRL_OR_CMD] &&
-          this.getTextBindableContainerAtPosition(sceneX, sceneY);
+          // a single selected element is what the double-click is about —
+          // typing into it — wherever the click lands
+          (selectedElements.length === 1
+            ? isTextBindableContainer(selectedElements[0], false)
+              ? selectedElements[0]
+              : null
+            : this.getTextBindableContainerAtPosition(sceneX, sceneY));
 
         if (container) {
           if (
@@ -7867,12 +8006,7 @@ class App extends React.Component<AppProps, AppState> {
 
     this.updateMultiTouchGesture(event);
 
-    if (
-      this.pan.isSpaceHeld() ||
-      this.pan.isActive() ||
-      isDraggingScrollBar ||
-      isHandToolActive(this.state)
-    ) {
+    if (this.pan.isNavigating()) {
       return;
     }
 
@@ -7900,6 +8034,12 @@ class App extends React.Component<AppProps, AppState> {
         x: scenePointerX,
         y: scenePointerY,
       },
+      isOverScrollBar,
+    );
+
+    const textToolTarget = this.textTool.updateHover(
+      scenePointer,
+      event,
       isOverScrollBar,
     );
 
@@ -7988,11 +8128,14 @@ class App extends React.Component<AppProps, AppState> {
           scenePointerY,
         );
         const elementsMap = this.scene.getNonDeletedElementsMap();
+        const arrow = {
+          elbowed: this.state.currentItemArrowType === ARROW_TYPE.elbow,
+        };
         const hoveredElement = getHoveredElementForBinding(
           globalPoint,
           this.scene.getNonDeletedElements(),
           elementsMap,
-          maxBindingDistance_simple(this.state.zoom),
+          this.state.zoom,
         );
         if (hoveredElement) {
           this.setState({
@@ -8003,6 +8146,7 @@ class App extends React.Component<AppProps, AppState> {
                 hoveredElement,
                 elementsMap,
                 this.state.zoom,
+                arrow,
               ),
             },
           });
@@ -8114,6 +8258,7 @@ class App extends React.Component<AppProps, AppState> {
             pointFrom<GlobalPoint>(scenePointerX, scenePointerY),
             this.scene.getNonDeletedElements(),
             elementsMap,
+            this.state.zoom,
           );
 
           if (getFeatureFlag("COMPLEX_BINDINGS")) {
@@ -8149,7 +8294,7 @@ class App extends React.Component<AppProps, AppState> {
         scenePointer,
         this.scene.getNonDeletedElements(),
         this.scene.getNonDeletedElementsMap(),
-        maxBindingDistance_simple(this.state.zoom),
+        this.state.zoom,
       );
       const elementsMap = this.scene.getNonDeletedElementsMap();
       if (hit && !isPointInElement(scenePointer, hit, elementsMap)) {
@@ -8161,6 +8306,7 @@ class App extends React.Component<AppProps, AppState> {
               hit,
               elementsMap,
               this.state.zoom,
+              { elbowed: this.state.currentItemArrowType === ARROW_TYPE.elbow },
             ),
           },
         });
@@ -8283,9 +8429,6 @@ class App extends React.Component<AppProps, AppState> {
       hitElement = hitElementMightBeLocked;
     }
 
-    const hoveredArrowTextAnchor =
-      this.arrowText.updateHoveredAnchor(scenePointer);
-
     if (
       !this.handleIframeLikeElementHover({
         hitElement,
@@ -8312,13 +8455,7 @@ class App extends React.Component<AppProps, AppState> {
       ) {
         this.setState({ showHyperlinkPopup: "info" });
       } else if (this.state.activeTool.type === "text") {
-        this.cursor.set(
-          hoveredArrowTextAnchor
-            ? CURSOR_TYPE.POINTER
-            : isTextElement(hitElement)
-            ? CURSOR_TYPE.TEXT
-            : CURSOR_TYPE.CROSSHAIR,
-        );
+        this.cursor.set(this.textTool.cursorFor(textToolTarget));
       } else if (
         !event[KEYS.CTRL_OR_CMD] &&
         this.isHittingCommonBoundingBoxOfSelectedElements(
@@ -8967,7 +9104,7 @@ class App extends React.Component<AppProps, AppState> {
         pointerDownState.hit.wasAddedToSelection = true;
       }
     } else if (this.state.activeTool.type === "text") {
-      this.handleTextOnPointerDown(event, pointerDownState);
+      this.textTool.handlePointerDown(event, pointerDownState);
     } else if (
       this.state.activeTool.type === "arrow" ||
       this.state.activeTool.type === "line"
@@ -9059,6 +9196,19 @@ class App extends React.Component<AppProps, AppState> {
       pointerDownState.eventListeners.onKeyUp = onKeyUp;
       pointerDownState.eventListeners.onKeyDown = onKeyDown;
     }
+  };
+
+  /**
+   * The browser took the pointer over (scroll, pinch, palm rejection): no
+   * pointerup will follow, so the gesture is torn down here and now — the
+   * same cleanup a lost pointerup gets at the next press, only not left
+   * lying in wait for it, where its replay would tangle with that press.
+   */
+  private handleCanvasPointerCancel = (
+    event: React.PointerEvent<HTMLCanvasElement>,
+  ) => {
+    this.removePointer(event);
+    this.maybeCleanupAfterMissingPointerUp(event.nativeEvent);
   };
 
   private handleCanvasPointerUp = (
@@ -9846,84 +9996,6 @@ class App extends React.Component<AppProps, AppState> {
     );
   }
 
-  private handleTextOnPointerDown = (
-    event: React.PointerEvent<HTMLElement>,
-    pointerDownState: PointerDownState,
-  ): void => {
-    // if we're currently still editing text, clicking outside
-    // should only finalize it, not create another (irrespective
-    // of state.activeTool.locked)
-    if (this.state.editingTextElement) {
-      return;
-    }
-    let sceneX = pointerDownState.origin.x;
-    let sceneY = pointerDownState.origin.y;
-
-    // the click transitions into text editing either way, consuming (or
-    // bypassing) whatever anchor was highlighted — don't leave it lingering
-    // under the editor, which outlives the hover when the tool is locked
-    this.setState({ hoveredArrowTextAnchor: null });
-
-    // a free arrow endpoint takes precedence over adding a label *to* the
-    // arrow — it's the smaller, more deliberate target
-    const arrowEndpoint = this.arrowText.getBindableEndpointAtPosition(
-      sceneX,
-      sceneY,
-    );
-
-    if (arrowEndpoint) {
-      this.startTextEditing({
-        sceneX,
-        sceneY,
-        // the binding fixes the position, but the width is still the user's
-        // to drag out (see `getEndpointBoundTextDragAnchor`)
-        autoEdit: false,
-        arrowEndpoint,
-      });
-    } else {
-      const element = this.getElementAtPosition(sceneX, sceneY, {
-        includeBoundTextElement: true,
-      });
-
-      // FIXME
-      let container = this.getTextBindableContainerAtPosition(sceneX, sceneY);
-
-      if (hasBoundTextElement(element)) {
-        container = element as NonDeleted<ExcalidrawTextContainer>;
-        const labelCenter = this.arrowText.getLabelCenter(element);
-        if (labelCenter) {
-          sceneX = labelCenter.x;
-          sceneY = labelCenter.y;
-        } else {
-          sceneX = element.x + element.width / 2;
-          sceneY = element.y + element.height / 2;
-        }
-      }
-      this.startTextEditing({
-        sceneX,
-        sceneY,
-        insertAtParentCenter: !event.altKey,
-        container,
-        autoEdit: false,
-        initialCaretSceneCoords: { x: sceneX, y: sceneY },
-      });
-    }
-
-    if (!this.isToolLocked()) {
-      this.setState(
-        {
-          activeTool: updateActiveTool(this.state, {
-            type: this.state.preferredSelectionTool.type,
-          }),
-        },
-        // reset once the tool revert has settled
-        () => this.cursor.reset(),
-      );
-    } else {
-      this.cursor.reset();
-    }
-  };
-
   private handleFreeDrawElementOnPointerDown = (
     event: React.PointerEvent<HTMLElement>,
     elementType: ExcalidrawFreeDrawElement["type"],
@@ -10213,7 +10285,6 @@ class App extends React.Component<AppProps, AppState> {
               this.state,
               {
                 newArrow: Boolean(this.state.newElement),
-                zoom: this.state.zoom,
               },
             )
           : { end: { mode: undefined } };
@@ -10347,6 +10418,7 @@ class App extends React.Component<AppProps, AppState> {
             point,
             this.scene.getNonDeletedElements(),
             elementsMap,
+            this.state.zoom,
           )
         : null;
 
@@ -10428,6 +10500,7 @@ class App extends React.Component<AppProps, AppState> {
                       boundElement,
                       elementsMap,
                       this.state.zoom,
+                      element,
                     ),
                   }
                 : null,
@@ -10571,7 +10644,7 @@ class App extends React.Component<AppProps, AppState> {
     });
   };
 
-  private maybeCacheReferenceSnapPoints(
+  public maybeCacheReferenceSnapPoints(
     event: KeyboardModifiersObject,
     selectedElements: readonly NonDeletedExcalidrawElement[],
     recomputeAnyways: boolean = false,
@@ -10595,7 +10668,7 @@ class App extends React.Component<AppProps, AppState> {
     }
   }
 
-  private maybeCacheVisibleGaps(
+  public maybeCacheVisibleGaps(
     event: KeyboardModifiersObject,
     selectedElements: readonly NonDeletedExcalidrawElement[],
     recomputeAnyways: boolean = false,
@@ -10736,6 +10809,10 @@ class App extends React.Component<AppProps, AppState> {
         return;
       }
 
+      if (this.textTool.handlePointerMove(event, pointerDownState)) {
+        return;
+      }
+
       if (isEraserActive(this.state)) {
         this.handleEraser(event, pointerCoords);
         return;
@@ -10858,16 +10935,15 @@ class App extends React.Component<AppProps, AppState> {
             return;
           }
 
-          if (isBindingElement(element)) {
+          if (isBindingElement(element) && getFeatureFlag("COMPLEX_BINDINGS")) {
             const hoveredElement = getHoveredElementForBinding(
               pointFrom<GlobalPoint>(pointerCoords.x, pointerCoords.y),
               this.scene.getNonDeletedElements(),
               elementsMap,
+              this.state.zoom,
             );
 
-            if (getFeatureFlag("COMPLEX_BINDINGS")) {
-              this.handleDelayedBindModeChange(element, hoveredElement);
-            }
+            this.handleDelayedBindModeChange(element, hoveredElement);
           }
 
           if (
@@ -11160,149 +11236,7 @@ class App extends React.Component<AppProps, AppState> {
 
           // We duplicate the selected element if alt is pressed on pointer move
           if (event.altKey && !pointerDownState.hit.hasBeenDuplicated) {
-            // Move the currently selected elements to the top of the z index stack, and
-            // put the duplicates where the selected elements used to be.
-            // (the origin point where the dragging started)
-
-            pointerDownState.hit.hasBeenDuplicated = true;
-
-            const elements = this.scene.getElementsIncludingDeleted();
-            const hitElement = pointerDownState.hit.element;
-            const selectedElements = this.scene.getSelectedElements({
-              selectedElementIds: this.state.selectedElementIds,
-              includeBoundTextElement: true,
-              includeElementsInFrames: true,
-            });
-            if (
-              hitElement &&
-              // hit element may not end up being selected
-              // if we're alt-dragging a common bounding box
-              // over the hit element
-              pointerDownState.hit.wasAddedToSelection &&
-              !selectedElements.find((el) => el.id === hitElement.id)
-            ) {
-              selectedElements.push(hitElement);
-            }
-
-            const idsOfElementsToDuplicate = new Map(
-              selectedElements.map((el) => [el.id, el]),
-            );
-
-            const {
-              duplicatedElements,
-              duplicateElementsMap,
-              elementsWithDuplicates,
-              origIdToDuplicateId,
-            } = duplicateElements({
-              type: "in-place",
-              elements,
-              appState: this.state,
-              randomizeSeed: true,
-              idsOfElementsToDuplicate,
-              overrides: ({ duplicateElement, origElement }) => {
-                return {
-                  // reset to the original element's frameId (unless we've
-                  // duplicated alongside a frame in which case we need to
-                  // keep the duplicate frame's id) so that the element
-                  // frame membership is refreshed on pointerup
-                  // NOTE this is a hacky solution and should be done
-                  // differently
-                  frameId: duplicateElement.frameId ?? origElement.frameId,
-                  seed: randomInteger(),
-                };
-              },
-            });
-            duplicatedElements.forEach((element) => {
-              pointerDownState.originalElements.set(
-                element.id,
-                deepCopyElement(element),
-              );
-            });
-
-            const mappedClonedElements = elementsWithDuplicates.map((el) => {
-              if (idsOfElementsToDuplicate.has(el.id)) {
-                const origEl = pointerDownState.originalElements.get(el.id);
-
-                if (origEl) {
-                  return newElementWith(el, {
-                    x: origEl.x,
-                    y: origEl.y,
-                  });
-                }
-              }
-              return el;
-            });
-
-            const mappedNewSceneElements = this.props.onDuplicate?.(
-              mappedClonedElements,
-              elements,
-            );
-
-            const elementsWithIndices = syncMovedIndices(
-              mappedNewSceneElements || mappedClonedElements,
-              arrayToMap(duplicatedElements),
-            );
-
-            // we need to update synchronously so as to keep pointerDownState,
-            // appState, and scene elements in sync
-            flushSync(() => {
-              // swap hit element with the duplicated one
-              if (pointerDownState.hit.element) {
-                const cloneId = origIdToDuplicateId.get(
-                  pointerDownState.hit.element.id,
-                );
-                const clonedElement =
-                  cloneId && duplicateElementsMap.get(cloneId);
-                pointerDownState.hit.element = clonedElement || null;
-              }
-              // swap hit elements with the duplicated ones
-              pointerDownState.hit.allHitElements =
-                pointerDownState.hit.allHitElements.reduce(
-                  (
-                    acc: typeof pointerDownState.hit.allHitElements,
-                    origHitElement,
-                  ) => {
-                    const cloneId = origIdToDuplicateId.get(origHitElement.id);
-                    const clonedElement =
-                      cloneId && duplicateElementsMap.get(cloneId);
-                    if (clonedElement) {
-                      acc.push(clonedElement);
-                    }
-
-                    return acc;
-                  },
-                  [],
-                );
-
-              // update drag origin to the position at which we started
-              // the duplication so that the drag offset is correct
-              pointerDownState.drag.origin = viewportCoordsToSceneCoords(
-                event,
-                this.state,
-              );
-
-              // switch selected elements to the duplicated ones
-              this.setState((prevState) => ({
-                ...getSelectionStateForElements(
-                  duplicatedElements,
-                  this.scene.getNonDeletedElements(),
-                  prevState,
-                ),
-              }));
-
-              this.scene.replaceAllElements(elementsWithIndices);
-              selectedElements.forEach((element) => {
-                if (
-                  isBindableElement(element) &&
-                  element.boundElements?.some((other) => other.type === "arrow")
-                ) {
-                  updateBoundElements(element, this.scene);
-                }
-              });
-
-              this.maybeCacheVisibleGaps(event, selectedElements, true);
-              this.maybeCacheReferenceSnapPoints(event, selectedElements, true);
-            });
+            this.duplicate.duplicateDraggedSelection(pointerDownState, event);
           }
 
           return;
@@ -11593,11 +11527,14 @@ class App extends React.Component<AppProps, AppState> {
         pointerDownState.eventListeners.onMove.flush();
       }
 
+      this.textTool.handlePointerUp(childEvent, pointerDownState);
+
       // an armed bucket fill commits only on a GENUINE pointer up. The
       // missing-pointer-up cleanup replays this handler with the pointer
       // DOWN event (e.g. when a second finger lands mid-press — pinch/pan
-      // intent), and a tool switch mid-press orphans the click — both must
-      // discard the fill instead of committing an unwanted edit.
+      // intent) or with a pointercancel, and a tool switch mid-press orphans
+      // the click — all must discard the fill instead of committing an
+      // unwanted edit.
       if (
         childEvent.type === "pointerup" &&
         this.state.activeTool.type === TOOL_TYPE.bucketfill
@@ -12666,6 +12603,12 @@ class App extends React.Component<AppProps, AppState> {
       }
 
       if (
+        // only a genuine pointerup is a click of the tool, which reverts it.
+        // A replay by the missing-pointerup cleanup — a second finger
+        // landing, a pointercancel, the next press after a lost pointerup —
+        // only tears the gesture down, and must leave the tool to the press
+        // that follows
+        childEvent.type === "pointerup" &&
         !this.isToolLocked() &&
         activeTool.type !== "freedraw" &&
         // bucket fill stays active for back-to-back fills regardless of the
@@ -13190,10 +13133,11 @@ class App extends React.Component<AppProps, AppState> {
   };
 
   private handleAppOnDrop = async (event: React.DragEvent<HTMLDivElement>) => {
-    // NOTE no preventDefault so the host page can handle the drop itself
-    if (!this.isInteractionEnabled()) {
+    if (!this.isFileDropEnabled()) {
       return;
     }
+    const { shiftKey, clientX, clientY } = event;
+    const insertPosition = shiftKey ? { clientX, clientY } : undefined;
     const { x: sceneX, y: sceneY } = viewportCoordsToSceneCoords(
       event,
       this.state,
@@ -13210,13 +13154,31 @@ class App extends React.Component<AppProps, AppState> {
         file &&
         (file.type === MIME_TYPES.png || file.type === MIME_TYPES.svg)
       ) {
+        let scene;
         try {
-          const scene = await loadFromBlob(
+          scene = await loadFromBlob(
             file,
             this.state,
             this.scene.getElementsIncludingDeleted(),
             fileHandle,
           );
+        } catch (error: any) {
+          if (error.name !== "EncodingError") {
+            throw new Error(t("alerts.couldNotLoadInvalidFile"));
+          }
+          // if EncodingError, fall through to insert as regular image
+        }
+        if (scene) {
+          if (insertPosition) {
+            this.addElementsFromPasteOrLibrary({
+              elements: scene.elements,
+              files: scene.files,
+              position: insertPosition,
+              retainSeed: true,
+              preserveFrameChildrenOrder: true,
+            });
+            return;
+          }
           this.syncActionResult({
             ...scene,
             appState: {
@@ -13226,12 +13188,8 @@ class App extends React.Component<AppProps, AppState> {
             replaceFiles: true,
             captureUpdate: CaptureUpdateAction.IMMEDIATELY,
           });
+          this.showSceneReplacedToast();
           return;
-        } catch (error: any) {
-          if (error.name !== "EncodingError") {
-            throw new Error(t("alerts.couldNotLoadInvalidFile"));
-          }
-          // if EncodingError, fall through to insert as regular image
         }
       }
     }
@@ -13292,7 +13250,9 @@ class App extends React.Component<AppProps, AppState> {
       const { file, fileHandle } = fileItems[0];
       if (file) {
         // Attempt to parse an excalidraw/excalidrawlib file
-        await this.loadFileToCanvas(file, fileHandle);
+        if (await this.loadFileToCanvas(file, fileHandle, insertPosition)) {
+          this.showSceneReplacedToast();
+        }
       }
     }
 
@@ -13319,9 +13279,11 @@ class App extends React.Component<AppProps, AppState> {
     }
   };
 
+  /** @returns true if the file replaced the scene */
   loadFileToCanvas = async (
     file: File,
     fileHandle: FileSystemFileHandle | null,
+    insertPosition?: { clientX: number; clientY: number },
   ) => {
     file = await normalizeFile(file);
     try {
@@ -13360,6 +13322,16 @@ class App extends React.Component<AppProps, AppState> {
       }
 
       if (ret.type === MIME_TYPES.excalidraw) {
+        if (insertPosition) {
+          this.addElementsFromPasteOrLibrary({
+            elements: ret.data.elements,
+            files: ret.data.files,
+            position: insertPosition,
+            retainSeed: true,
+            preserveFrameChildrenOrder: true,
+          });
+          return;
+        }
         // restore the fractional indices by mutating elements
         syncInvalidIndices(elements.concat(ret.data.elements));
 
@@ -13381,6 +13353,7 @@ class App extends React.Component<AppProps, AppState> {
           replaceFiles: true,
           captureUpdate: CaptureUpdateAction.IMMEDIATELY,
         });
+        return true;
       } else if (ret.type === MIME_TYPES.excalidrawlib) {
         await this.library
           .updateLibrary({
@@ -13503,7 +13476,7 @@ class App extends React.Component<AppProps, AppState> {
     );
   };
 
-  private maybeDragNewGenericElement = (
+  public maybeDragNewGenericElement = (
     pointerDownState: PointerDownState,
     event: MouseEvent | KeyboardEvent,
     informMutation = true,
